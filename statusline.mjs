@@ -3,11 +3,11 @@
  * Claude Code custom statusline
  * Dynamic rows: metrics + active tools/agents + environment
  * Truecolor per-character gradients, gradient dot meters, pink accents
- * Reads /tmp/claude/ data layer written by hooks
+ * Reads the data layer written by hooks/tool-tracker.mjs (active tool, agents, counters)
  */
 
 import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync, statSync, realpathSync, openSync, readSync, closeSync } from 'fs';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
@@ -97,8 +97,6 @@ const GRAD = {
   rules:   [[210, 160, 90], [250, 200, 140]],
   // CLAUDE.md: Claude orange → warm peach
   claudemd:[[230, 138, 80], [245, 188, 140]],
-  // GSD state: blue → violet
-  gsd:     [[130, 170, 240], [190, 150, 250]],
   // Separator: subtle warm
   sep:     [[80, 70, 90], [100, 80, 110]],
   // Label accents (dim versions of their meter gradients)
@@ -250,15 +248,33 @@ function fetchUsageApi(token) {
   });
 }
 
-async function getUsage() {
+const toInt = v => (v != null && Number.isFinite(v)) ? Math.round(Math.max(0, Math.min(100, v))) : null;
+const toDate = s => s ? new Date(s) : null;
+
+// Claude Code (2.1.x) passes `rate_limits` on stdin — the documented, token-free
+// source for the 5h / 7d meters. The OAuth usage endpoint is still consulted
+// (cached, 30s) because it is the only place the per-model 7d limit lives; when
+// stdin carries rate_limits they win for the two shared meters.
+async function getUsage(stdin) {
+  const rl = stdin?.rate_limits;
+  const native = (rl?.five_hour || rl?.seven_day) ? {
+    fiveHour:      toInt(rl.five_hour?.used_percentage),
+    sevenDay:      toInt(rl.seven_day?.used_percentage),
+    fiveHourReset: rl.five_hour?.resets_at ? new Date(rl.five_hour.resets_at * 1000) : null,
+    sevenDayReset: rl.seven_day?.resets_at ? new Date(rl.seven_day.resets_at * 1000) : null,
+  } : null;
+  const api = await getApiUsage();
+  if (!native && !api) return null;
+  return { ...(api ?? {}), ...(native ?? {}) };
+}
+
+async function getApiUsage() {
   const cached = readCache();
   if (cached) return cached;
   const token = getOAuthToken();
   if (!token) return readCache(true);
   const data = await fetchUsageApi(token);
   if (!data) return readCache(true);
-  const toInt = v => (v != null && Number.isFinite(v)) ? Math.round(Math.max(0, Math.min(100, v))) : null;
-  const toDate = s => s ? new Date(s) : null;
   // The `limits` array is the same data the claude.ai usage tab renders —
   // weekly_all = 7d across all models, weekly_scoped = 7d for one model (Fable).
   const limits = Array.isArray(data.limits) ? data.limits : [];
@@ -339,124 +355,6 @@ function getLastSkill(transcriptPath) {
     }
   } catch {}
   return null;
-}
-
-// ── GSD state (milestone/phase/task) ──────────────────────────────────────────
-// Ported read-only from GSD's own hooks/gsd-statusline.js so its milestone/phase
-// state can render as an extra row alongside this statusline, without GSD's
-// installer needing to own the statusLine key (it already skips that when one is
-// configured). Walks up from cwd for .planning/STATE.md; silent when absent, so
-// this is a no-op outside GSD-enabled projects. Does not touch .vault/.claude/.
-function readGsdState(dir) {
-  if (!dir) return null;
-  let current = dir;
-  for (let i = 0; i < 10; i++) {
-    const candidate = join(current, '.planning', 'STATE.md');
-    if (existsSync(candidate)) {
-      try { return parseStateMd(readFileSync(candidate, 'utf8')); }
-      catch { return null; }
-    }
-    const parent = dirname(current);
-    if (parent === current || current === HOME) break;
-    current = parent;
-  }
-  return null;
-}
-
-function parseStateMd(content) {
-  const state = {};
-  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
-  if (fmMatch) {
-    const fm = fmMatch[1];
-    for (const line of fm.split('\n')) {
-      const m = line.match(/^(\w+):\s*(.+)/);
-      if (!m) continue;
-      const [, key, val] = m;
-      const v = val.trim().replace(/^["']|["']$/g, '');
-      if (key === 'status') state.status = v === 'null' ? null : v;
-      if (key === 'milestone') state.milestone = v === 'null' ? null : v;
-      if (key === 'milestone_name') state.milestoneName = v === 'null' ? null : v;
-      if (key === 'active_phase') state.activePhase = (v === 'null' || v === '') ? null : v;
-      if (key === 'next_action') state.nextAction = (v === 'null' || v === '') ? null : v;
-    }
-    const npFlowMatch = fm.match(/^next_phases:\s*\[([^\]]*)\]/m);
-    if (npFlowMatch) {
-      const items = npFlowMatch[1].split(',').map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
-      state.nextPhases = items.length > 0 ? items : null;
-    } else {
-      const npBlockMatch = fm.match(/^next_phases:\s*\n((?:[ \t]*-[ \t]*[^\n]+\n?)*)/m);
-      if (npBlockMatch) {
-        const items = npBlockMatch[1]
-          .split('\n')
-          .map(line => line.match(/^[ \t]*-[ \t]*(.+)$/))
-          .filter(Boolean)
-          .map(m => m[1].trim().replace(/^["']|["']$/g, ''))
-          .filter(Boolean);
-        state.nextPhases = items.length > 0 ? items : null;
-      }
-    }
-    const progMatch = fm.match(/^progress:\s*\n((?:[ \t]+\w+:.+\n?)+)/m);
-    if (progMatch) {
-      const cp = progMatch[1].match(/^[ \t]+completed_phases:\s*(\d+)/m);
-      const tp = progMatch[1].match(/^[ \t]+total_phases:\s*(\d+)/m);
-      const pc = progMatch[1].match(/^[ \t]+percent:\s*(\d+)/m);
-      if (cp) state.completedPhases = cp[1];
-      if (tp) state.totalPhases = tp[1];
-      if (pc) state.percent = pc[1];
-    }
-  }
-  const phaseMatch = content.match(/^Phase:\s*(\d+)\s+of\s+(\d+)(?:\s+\(([^)]+)\))?/m);
-  if (phaseMatch) {
-    state.phaseNum = phaseMatch[1];
-    state.phaseTotal = phaseMatch[2];
-    state.phaseName = phaseMatch[3] || null;
-  }
-  if (!state.status) {
-    const bodyStatus = content.match(/^Status:\s*(.+)/m);
-    if (bodyStatus) {
-      const raw = bodyStatus[1].trim().toLowerCase();
-      if (raw.includes('ready to plan') || raw.includes('planning')) state.status = 'planning';
-      else if (raw.includes('execut')) state.status = 'executing';
-      else if (raw.includes('complet') || raw.includes('archived')) state.status = 'complete';
-    }
-  }
-  return state;
-}
-
-function renderProgressBar(percent) {
-  if (percent == null || isNaN(percent)) return '';
-  const pct = Math.max(0, Math.min(100, parseInt(percent, 10)));
-  const filled = Math.floor(pct / 10);
-  return `[${'█'.repeat(filled)}${'░'.repeat(10 - filled)}] ${pct}%`;
-}
-
-function formatGsdState(s) {
-  const parts = [];
-  if (s.milestone || s.milestoneName) {
-    const ver = s.milestone || '';
-    const name = (s.milestoneName && s.milestoneName !== 'milestone') ? s.milestoneName : '';
-    const bar = renderProgressBar(s.percent);
-    const pieces = [ver, name, bar].filter(Boolean);
-    if (pieces.length > 0) parts.push(pieces.join(' '));
-  }
-  const phasesStr = (s.nextPhases && s.nextPhases.length > 0) ? s.nextPhases.join('/') : null;
-  if (s.activePhase) {
-    const stage = s.status || '';
-    parts.push(stage ? `Phase ${s.activePhase} ${stage}` : `Phase ${s.activePhase}`);
-  } else if (s.nextAction && phasesStr) {
-    parts.push(`next ${s.nextAction} ${phasesStr}`);
-  } else if (Number(s.percent) === 100 || (s.completedPhases && s.totalPhases && s.completedPhases === s.totalPhases)) {
-    parts.push('milestone complete');
-  } else {
-    if (s.status) parts.push(s.status);
-    if (s.phaseNum && s.phaseTotal) {
-      const phase = s.phaseName
-        ? `${s.phaseName} (${s.phaseNum}/${s.phaseTotal})`
-        : `ph ${s.phaseNum}/${s.phaseTotal}`;
-      parts.push(phase);
-    }
-  }
-  return parts.join(' · ');
 }
 
 // ── Config counts ─────────────────────────────────────────────────────────────
@@ -633,6 +531,9 @@ function scopeTag(global, project, plugin) {
 // ── Path display ──────────────────────────────────────────────────────────────
 function showPath(cwd) {
   if (!cwd) return '';
+  // Windows hands over backslashes; normalise so the shortening below applies there too.
+  cwd = cwd.replace(/\\/g, '/');
+  const home = HOME.replace(/\\/g, '/');
   const parts = cwd.replace(/\/$/, '').split('/').filter(Boolean);
   if (parts.length === 0) return '/';
   const last = parts[parts.length - 1];
@@ -646,8 +547,8 @@ function showPath(cwd) {
   }
 
   // Internal SSD, under $HOME: "~/…/<last>"
-  if (cwd.startsWith(HOME)) {
-    const rel = cwd.slice(HOME.length);
+  if (cwd.toLowerCase().startsWith(home.toLowerCase())) {
+    const rel = cwd.slice(home.length);
     const homeParts = rel.split('/').filter(Boolean);
     if (homeParts.length <= 2) return '~' + rel;
     return `~/…/${last}`;
@@ -675,8 +576,11 @@ function showModel(stdin) {
   return suffix ? `${cleaned} - ${suffix}` : cleaned;
 }
 
-// ── Data layer (/tmp/claude/) ─────────────────────────────────────────────────
-const DATA_DIR = '/tmp/claude';
+// ── Data layer (written by hooks/tool-tracker.mjs) ───────────────────────────
+// Same resolution as the hook: CLAUDE_STATUSLINE_DIR, else %TEMP%\claude-statusline
+// on Windows, else /tmp/claude-statusline.
+const DATA_DIR = process.env.CLAUDE_STATUSLINE_DIR
+  || (process.platform === 'win32' ? join(tmpdir(), 'claude-statusline') : '/tmp/claude-statusline');
 const TOOL_STALE = 300; // seconds before tool-now is considered stale
 
 function readJson(file) {
@@ -739,7 +643,8 @@ function fmtDur(seconds) {
 
 // ── MAIN ──────────────────────────────────────────────────────────────────────
 async function main() {
-  const [stdin, usage] = await Promise.all([readStdin(), getUsage()]);
+  const stdin = await readStdin();
+  const usage = await getUsage(stdin);
 
   const model   = showModel(stdin);
   const cwd     = stdin?.cwd ?? '';
@@ -762,7 +667,6 @@ async function main() {
 
   const git      = ttlCache('git', cwd, 10_000, () => getGit(cwd));
   const skill    = getLastSkill(stdin?.transcript_path ?? '');
-  const gsdState = formatGsdState(readGsdState(cwd) || {});
   const { hooks, hooksGlobal, hooksProject,
           mcps, mcpsGlobal, mcpsProject,
           skills, skillsGlobal, skillsPlugin, skillsProject,
@@ -875,10 +779,6 @@ async function main() {
     rowEnv.push(agentStr + extra);
   }
 
-  // ── Row 4: GSD milestone/phase state (only when .planning/STATE.md exists
-  // upward from cwd — silent no-op outside GSD-enabled projects) ───────────
-  const rowGsd = gsdState ? gradientText(`gsd: ${gsdState}`, GRAD.gsd) : null;
-
   // ── Output (every row width-fitted; env row drops from the right) ───────
   console.log(fitRow(row1, row1DropOrder));
   if (toolRow) console.log(toolRow);
@@ -886,7 +786,6 @@ async function main() {
     const env = fitRow(rowEnv);
     if (env) console.log(env);
   }
-  if (rowGsd) console.log(fitRow([rowGsd]));
 }
 
 main().catch(() => process.exit(0));

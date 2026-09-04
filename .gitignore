@@ -1,0 +1,4 @@
+statusline-cache/
+*.log
+.DS_Store
+Thumbs.db
